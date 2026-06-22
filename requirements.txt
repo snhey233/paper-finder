@@ -1,0 +1,6 @@
+playwright>=1.40.0
+websocket-client>=1.6.0
+requests>=2.28.0
+python-dotenv>=1.0.0
+openpyxl>=3.1.0
+# scihub (可选): pip install scihub  # PyPI 最新版为 0.0.1
