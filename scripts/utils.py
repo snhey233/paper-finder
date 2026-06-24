@@ -407,9 +407,7 @@ def connect_playwright_async(port=9222):
         ctx = browser.contexts[0]
         pages = ctx.pages
         page = pages[0] if pages else await ctx.new_page()
-        # close extra pages
-        for pg in pages[1:]:
-            await pg.close()
+        # Don't close extra pages - user may have other tabs open
         return p, browser, page
     return _connect
 

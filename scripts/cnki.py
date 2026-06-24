@@ -54,6 +54,17 @@ def connect_browser():
         raise
     context = browser.contexts[0]
 
+    # 检查是否已有知网页面，复用而非新建
+    for pg in context.pages:
+        if "cnki" in pg.url.lower() and "kns8" in pg.url.lower():
+            log("CNKI", f"Reusing existing CNKI tab: {pg.url[:80]}")
+            try:
+                pg.goto(pg.url, wait_until="load", timeout=15000)
+            except Exception:
+                pass
+            time.sleep(2)
+            return p, browser, context, pg
+
     # 创建新标签页并导航到知网VPN
     page = context.new_page()
     nav_url = f"https://{CNKI_VPN_DOMAIN}/kns8s/defaultresult/index"
@@ -65,25 +76,23 @@ def connect_browser():
     return p, browser, context, page
 
 
-def search(page, keyword):
-    """搜索关键词"""
+def search(page, keyword, start_year=None, end_year=None):
+    """搜索关键词 - 优先直接URL"""
     log("CNKI", f"Searching: {keyword}")
     time.sleep(2)
 
+    # 直接构造搜索URL
+    encoded = urllib.parse.quote(keyword)
+    search_url = f"https://{CNKI_VPN_DOMAIN}/kns8s/defaultresult/index?korder=SU&kw={encoded}"
+    if start_year and end_year:
+        search_url += f"&year={start_year}%2C{end_year}"
     try:
-        search_box = page.locator('input[type="text"]').first
-        search_box.fill("")
-        search_box.fill(keyword)
-        time.sleep(1)
-        page.locator("text=检索").first.click()
-        time.sleep(3)
-        log("CNKI", "Search done")
-    except Exception as e:
-        log("CNKI", f"Search exception: {e}, trying direct URL...")
-        encoded = urllib.parse.quote(keyword)
-        search_url = f"https://{CNKI_VPN_DOMAIN}/kns8s/defaultresult/index?korder=SU&kw={encoded}"
         page.goto(search_url, wait_until="load", timeout=30000)
         time.sleep(3)
+        log("CNKI", f"Navigated to search URL: {search_url[:80]}...")
+    except Exception as e:
+        log("CNKI", f"Navigation exception: {e}")
+        time.sleep(2)
 
 
 def set_filters(page, start_year, end_year, sources, sort_by):
@@ -145,23 +154,54 @@ def set_filters(page, start_year, end_year, sources, sort_by):
 
 
 def get_articles(page, count):
-    """获取文献列表"""
-    time.sleep(2)
+    """获取文献列表 - 支持多个选择器"""
+    time.sleep(3)
     articles = []
     try:
         articles = page.evaluate(f"""
         () => {{
             const results = [];
-            const links = document.querySelectorAll('a.fz14');
             const seen = new Set();
-            links.forEach(el => {{
-                const t = (el.textContent || '').trim();
-                const h = el.href || '';
-                if (t.length > 10 && !seen.has(t)) {{
-                    seen.add(t);
-                    results.push({{title: t, href: h}});
-                }}
-            }});
+
+            // Try multiple CSS selectors for article title links
+            const selectors = [
+                'a.fz14',           // old CNKI
+                '.title a',          // common pattern
+                'dt a', 'dd a',      // definition list
+                '[class*="title"] a',
+                '[class*="result"] a',
+                'a[name]',
+                'h3 a', 'h4 a',      // heading links
+                'td.gwname a',       // CNKI result table
+                '.name a',
+                '.latestResult a',
+            ];
+            for (const sel of selectors) {{
+                const els = document.querySelectorAll(sel);
+                els.forEach(el => {{
+                    const t = (el.textContent || '').trim();
+                    const h = el.href || '';
+                    if (t.length > 5 && !seen.has(t) && h && !h.startsWith('javascript')) {{
+                        seen.add(t);
+                        results.push({{title: t, href: h}});
+                    }}
+                }});
+                if (results.length > 0) break;
+            }}
+
+            // Fallback: get all links with meaningful text
+            if (results.length === 0) {{
+                const allLinks = document.querySelectorAll('a');
+                allLinks.forEach(el => {{
+                    const t = (el.textContent || '').trim();
+                    const h = el.href || '';
+                    if (t.length > 10 && !seen.has(t) && h && h.indexOf('kns8') > -1) {{
+                        seen.add(t);
+                        results.push({{title: t, href: h}});
+                    }}
+                }});
+            }}
+
             return JSON.stringify(results.slice(0, {count}));
         }}
         """)
@@ -169,6 +209,9 @@ def get_articles(page, count):
     except Exception as e:
         log("CNKI", f"Get articles exception: {e}")
     log("CNKI", f"Found {len(articles)} articles")
+    if len(articles) > 0:
+        for a in articles[:3]:
+            log("CNKI", f"  - {a['title'][:50]}")
     return articles
 
 
@@ -260,8 +303,8 @@ def main(args_text: str):
 
     p, browser, context, page = connect_browser()
     try:
-        search(page, keyword)
-        set_filters(page, params["start_year"], params["end_year"], params["sources"], params["sort_by"])
+        search(page, keyword, params["start_year"], params["end_year"])
+        # 跳过 set_filters，年份已在 URL 中指定
         articles = get_articles(page, params["count"])
 
         if not articles:
@@ -278,13 +321,9 @@ def main(args_text: str):
                 f.write(f"{i+1}. {a['title']}\n   URL: {a['href']}\n\n")
         log("CNKI", f"List saved: {list_path}")
 
-        # 用户确认后下载
-        log("CNKI", f"\nPress Enter to download {min(params['count'], len(articles))} papers, Ctrl+C to cancel...")
-        try:
-            input()
-        except KeyboardInterrupt:
-            log("CNKI", "Cancelled")
-            return
+        # Auto-continue to download
+        actual_count = min(params['count'], len(articles))
+        log("CNKI", f"Downloading {actual_count} papers...")
 
         failed_rec = FailedRecord()
         download_articles(context, articles, params["count"], output_dir, failed_rec)

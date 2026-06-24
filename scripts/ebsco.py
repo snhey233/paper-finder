@@ -176,12 +176,14 @@ async def main_async(args_text: str):
             await page.keyboard.press("Enter")
             await page.wait_for_timeout(5000)
 
-        # Extract articles
+        # Extract articles with multiple selector strategies
         articles = await page.evaluate("""
         () => {
-            var cards = document.querySelectorAll('[class*=search-result]');
             var results = [];
             var seen = {};
+
+            // Strategy 1: Standard EBSCO result cards
+            var cards = document.querySelectorAll('[class*=search-result]');
             cards.forEach(function(c) {
                 var link = c.querySelector('a[href*="search/details"]');
                 if (link && link.href) {
@@ -193,6 +195,56 @@ async def main_async(args_text: str):
                     }
                 }
             });
+
+            // Strategy 2: Look for result item links
+            if (results.length === 0) {
+                var links = document.querySelectorAll('a[href*="details"]');
+                links.forEach(function(link) {
+                    var m = (link.href || '').match(/\\/details\\/([a-z0-9]+)/);
+                    var title = (link.textContent || '').trim();
+                    if (m && title.length > 10 && !seen[m[1]]) {
+                        seen[m[1]] = true;
+                        results.push({id: m[1], title: title.substring(0, 120)});
+                    }
+                });
+            }
+
+            // Strategy 3: All links with long text
+            if (results.length === 0) {
+                var allLinks = document.querySelectorAll('a');
+                allLinks.forEach(function(el) {
+                    var t = (el.textContent || '').trim();
+                    var h = el.href || '';
+                    if (t.length > 20 && h && h.indexOf('/c/') > -1) {
+                        var idMatch = h.match(/\\/details\\/([a-z0-9]+)/) || h.match(/\\/record\\/([a-z0-9]+)/);
+                        if (idMatch && !seen[idMatch[1]]) {
+                            seen[idMatch[1]] = true;
+                            results.push({id: idMatch[1], title: t.substring(0, 120)});
+                        }
+                    }
+                });
+            }
+
+            // Strategy 4: Check table rows
+            if (results.length === 0) {
+                var rows = document.querySelectorAll('tr');
+                rows.forEach(function(row) {
+                    var link = row.querySelector('a');
+                    if (link) {
+                        var t = (link.textContent || '').trim();
+                        var h = link.href || '';
+                        if (t.length > 20 && h) {
+                            var idMatch = h.match(/\\/details\\/([a-z0-9]+)/) || h.match(/\\/record\\/([a-z0-9]+)/);
+                            var id = idMatch ? idMatch[1] : 'id_' + t.substring(0, 20).replace(/\\W/g, '_');
+                            if (!seen[id]) {
+                                seen[id] = true;
+                                results.push({id: id, title: t.substring(0, 120)});
+                            }
+                        }
+                    }
+                });
+            }
+
             return results;
         }
         """)

@@ -120,39 +120,138 @@ async def search_ieee(page, query, start_year, end_year, sort_by, vpn_domain="")
 async def try_direct_pdf(page, doc_id, vpn_domain=""):
     """尝试通过 IEEE stamp 端点直接下载 PDF"""
     domain = ieee_domain(vpn_domain)
-    stamp_url = f"https://{domain}/stamp/stamp.jsp?tp=&arnumber={doc_id}"
-    resp = await page.context.request.get(stamp_url, timeout=30000)
-    if resp:
-        content = await resp.body()
-        if b"%PDF" in content[:500] or len(content) > 80000:
-            return content
+    # 尝试多个PDF端点
+    pdf_urls = [
+        f"https://{domain}/stampPDF/getPDF.jsp?tp=&arnumber={doc_id}",
+        f"https://{domain}/stamp/stamp.jsp?tp=&arnumber={doc_id}",
+        f"https://{domain}/document/{doc_id}/pdf",
+    ]
+    for pdf_url in pdf_urls:
+        try:
+            resp = await page.context.request.get(pdf_url, timeout=30000)
+            if resp:
+                content = await resp.body()
+                if b"%PDF" in content[:500]:
+                    return content
+                # 检查是否是重定向到PDF
+                if len(content) > 80000:
+                    return content
+        except Exception:
+            continue
     return None
 
 
-async def try_print_pdf(page, doc_id, vpn_domain=""):
-    """通过 VPN 访问文章页，用打印到PDF下载（适用于非OA论文）"""
+async def try_click_pdf_download(browser, context, page, doc_id, vpn_domain=""):
+    """通过点击文章页面的PDF下载按钮获取真正的PDF文件"""
     domain = ieee_domain(vpn_domain)
     article_url = f"https://{domain}/document/{doc_id}"
+
     try:
-        await page.goto(article_url, wait_until="domcontentloaded", timeout=30000)
+        await page.goto(article_url, wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(5000)
 
-        # 检查是否可访问（非OA也能看到摘要页）
         title = await page.title()
-        if "IEEE" not in title and "Page" not in title:
+        if "IEEE" not in title:
+            log("IEEE", f"    Page not accessible: {title[:50]}")
             return None
 
-        # 打印到PDF
-        pdf_data = await page.pdf()
-        if len(pdf_data) > 50000:
-            return pdf_data
+        # 尝试多种选择器定位PDF下载按钮
+        pdf_btn = None
+        pdf_selectors = [
+            'a[href*="pdf"]',                    # 直接PDF链接
+            'a.icon-pdf',                         # 图标类
+            '[class*="pdf"] a',                   # PDF类链接
+            'a[class*="pdf"]',                    # PDF类链接
+            '[data-action="download"]',           # data-action属性
+            'a[href*="/stamp/stamp"]',            # stamp端点链接
+        ]
+        for sel in pdf_selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=2000) or await btn.count() > 0:
+                    pdf_btn = btn
+                    log("IEEE", f"    Found PDF button via: {sel}")
+                    break
+            except Exception:
+                continue
+
+        if not pdf_btn:
+            log("IEEE", "    No PDF download button found")
+            return None
+
+        # 策略1：获取href属性直接提取PDF
+        try:
+            pdf_href = await pdf_btn.get_attribute("href")
+            if pdf_href:
+                if pdf_href.startswith("/"):
+                    pdf_href = f"https://{domain}{pdf_href}"
+                elif not pdf_href.startswith("http"):
+                    pdf_href = f"https://{domain}/document/{doc_id}/{pdf_href}"
+
+                resp = await page.context.request.get(pdf_href, timeout=60000)
+                if resp:
+                    content = await resp.body()
+                    if b"%PDF" in content[:500]:
+                        log("IEEE", f"    Got PDF via href ({len(content)} bytes)")
+                        return content
+        except Exception as e:
+            log("IEEE", f"    href fetch failed: {str(e)[:40]}")
+
+        # 策略2：使用CDP网络拦截捕获PDF响应
+        try:
+            pdf_content = []
+            pdf_url_found = []
+
+            async def handle_response(response):
+                url = response.url
+                # 捕获PDF相关响应
+                if any(x in url for x in [".pdf", "/pdf", "fulltext-pdf", "stamp/stamp"]):
+                    try:
+                        body = await response.body()
+                        if b"%PDF" in body[:500]:
+                            pdf_content.append(body)
+                            pdf_url_found.append(url)
+                            log("IEEE", f"    Intercepted PDF: {url[-50:]}")
+                    except Exception:
+                        pass
+
+            page.on("response", handle_response)
+            await pdf_btn.click()
+            await page.wait_for_timeout(8000)
+
+            if pdf_content:
+                log("IEEE", f"    Got PDF via CDP intercept ({len(pdf_content[0])} bytes)")
+                return pdf_content[0]
+        except Exception as e:
+            log("IEEE", f"    CDP intercept: {str(e)[:40]}")
+
+        # 策略3：检查当前页面是否有PDF嵌入
+        try:
+            pdf_src = await page.evaluate("""() => {
+                const embeds = document.querySelectorAll('embed[type="application/pdf"], iframe[src*=".pdf"]');
+                if (embeds.length > 0) return embeds[0].src || embeds[0].getAttribute('src') || '';
+                return '';
+            }""")
+            if pdf_src:
+                if pdf_src.startswith("/"):
+                    pdf_src = f"https://{domain}{pdf_src}"
+                resp = await page.context.request.get(pdf_src, timeout=60000)
+                if resp:
+                    content = await resp.body()
+                    if b"%PDF" in content[:500]:
+                        log("IEEE", f"    Got PDF via embed/iframe ({len(content)} bytes)")
+                        return content
+        except Exception:
+            pass
+
         return None
-    except Exception:
+    except Exception as e:
+        log("IEEE", f"    PDF click error: {str(e)[:50]}")
         return None
 
 
-async def download_papers(page, papers, output_dir, count, failed, vpn_domain=""):
-    """批量下载 PDF，返回成功数"""
+async def download_papers(browser, context, page, papers, output_dir, count, failed, vpn_domain=""):
+    """批量下载 PDF，通过点击PDF按钮获取真实PDF"""
     downloaded = 0
     for i, paper in enumerate(papers[:count]):
         title = paper.get("title", "")
@@ -172,7 +271,7 @@ async def download_papers(page, papers, output_dir, count, failed, vpn_domain=""
             log("IEEE", "    No document ID")
             continue
 
-        # Method 1: IEEE direct (for OA)
+        # Method 1: IEEE stamp direct (for OA)
         content = await try_direct_pdf(page, doc_id, vpn_domain)
         if content:
             fp = os.path.join(output_dir, f"{i+1:02d}_{safe_title}.pdf")
@@ -180,7 +279,7 @@ async def download_papers(page, papers, output_dir, count, failed, vpn_domain=""
                 f.write(content)
             ok, msg = validate_pdf(fp)
             if ok:
-                log("IEEE", f"    DOWNLOADED from IEEE ({len(content)} bytes)")
+                log("IEEE", f"    DOWNLOADED from IEEE stamp ({len(content)} bytes)")
                 downloaded += 1
                 continue
             try:
@@ -188,23 +287,22 @@ async def download_papers(page, papers, output_dir, count, failed, vpn_domain=""
             except OSError:
                 pass
 
-        # Method 2: Print-to-PDF via VPN (for non-OA)
-        if vpn_domain:
-            log("IEEE", "    Trying print-to-PDF via VPN...")
-            content = await try_print_pdf(page, doc_id, vpn_domain)
-            if content:
-                fp = os.path.join(output_dir, f"{i+1:02d}_{safe_title}.pdf")
-                with open(fp, "wb") as f:
-                    f.write(content)
-                ok, msg = validate_pdf(fp)
-                if ok:
-                    log("IEEE", f"    DOWNLOADED via VPN print-to-PDF ({len(content)} bytes)")
-                    downloaded += 1
-                    continue
-                try:
-                    os.remove(fp)
-                except OSError:
-                    pass
+        # Method 2: 点击页面上的PDF下载按钮（学校订阅下载）
+        log("IEEE", "    Clicking PDF download button...")
+        content = await try_click_pdf_download(browser, context, page, doc_id, vpn_domain)
+        if content:
+            fp = os.path.join(output_dir, f"{i+1:02d}_{safe_title}.pdf")
+            with open(fp, "wb") as f:
+                f.write(content)
+            ok, msg = validate_pdf(fp)
+            if ok:
+                log("IEEE", f"    DOWNLOADED via PDF button ({len(content)} bytes)")
+                downloaded += 1
+                continue
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
 
         # Method 3: Sci-Hub fallback (inline)
         if doi:
@@ -258,6 +356,7 @@ async def main_async(args_text: str):
     p, browser = None, None
     try:
         p, browser, page = await connect_playwright_async_with_timeout(timeout=30000)
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
     except Exception as e:
         log("IEEE", f"ERROR: Cannot connect to Chrome: {e}")
         return
@@ -277,7 +376,7 @@ async def main_async(args_text: str):
         save_json(papers[: params["count"]], os.path.join(output_dir, "papers_list.json"))
 
         failed = FailedRecord()
-        dl_count = await download_papers(page, papers, output_dir, params["count"], failed, vpn_domain)
+        dl_count = await download_papers(browser, context, page, papers, output_dir, params["count"], failed, vpn_domain)
 
         log("IEEE", f"Done! Papers found: {len(papers)}, PDFs downloaded: {dl_count}/{min(params['count'], len(papers))}")
         if failed.count > 0:
